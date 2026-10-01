@@ -4,10 +4,14 @@
 
 1. 单元测试（``python -m unittest`` 全量）；
 2. 构建检查（全部源码字节编译 + 关键模块导入）；
-3. HTTP 冒烟（健康检查 + 三个必测场景）：
-   a. 双类型重定位（R_X86_64_64 + R_X86_64_PC32）成功并逐项返回 S/A/P；
-   b. 重叠写入被拒绝（patch_overlap）；
-   c. PC32 有符号 32 位溢出被拒绝（pc32_overflow），且无部分结果。
+3. HTTP 冒烟（健康检查 + 必测场景）：
+   a. ET_REL 双类型重定位（R_X86_64_64 + R_X86_64_PC32）成功并逐项返回 S/A/P；
+   b. ET_REL 重叠写入被拒绝（patch_overlap）；
+   c. ET_REL PC32 有符号 32 位溢出被拒绝（pc32_overflow），且无部分结果；
+   d. ET_DYN(PIE) R_X86_64_RELATIVE + R_X86_64_GLOB_DAT 成功，逐项给出
+      写入虚拟地址/文件偏移/运行地址/所属映射；
+   e. ET_DYN 补丁目标落在非可执行 PT_LOAD（跨映射）被拒绝
+      （target_not_executable），且旧成功结论被清除。
 
 任何一步失败立即以非零退出码结束；全部成功退出码为 0。
 """
@@ -30,7 +34,12 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
 
-from elfbuild import build_elf  # noqa: E402
+from elfbuild import (  # noqa: E402
+    PIE_RODATA2_VADDR,
+    PIE_TEXT_AT,
+    build_elf,
+    build_pie,
+)
 
 BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:8080")
 TIMEOUT = 5
@@ -160,6 +169,33 @@ def pc32_overflow_elf() -> bytes:
     )
 
 
+PIE_BIAS = 0x7F000000
+
+
+def pie_ok_elf() -> bytes:
+    """RELATIVE + 外部 GLOB_DAT + 映像内 GLOB_DAT 三项。"""
+    return build_pie(
+        text=bytes(range(64)),
+        symbols=[
+            ("ext_foo", 0, 0),
+            ("local_fn", 1, PIE_TEXT_AT + 0x20),
+        ],
+        relocs=[
+            {"offset": PIE_TEXT_AT + 0x00, "sym": 0, "type": 8, "addend": PIE_TEXT_AT + 0x10},
+            {"offset": PIE_TEXT_AT + 0x08, "sym": 1, "type": 6, "addend": 0x20},
+            {"offset": PIE_TEXT_AT + 0x10, "sym": 2, "type": 6, "addend": -8},
+        ],
+    )
+
+
+def pie_cross_mapping_elf() -> bytes:
+    """GLOB_DAT 目标落在 r-- 的第二个 PT_LOAD（跨映射），必须拒绝。"""
+    return build_pie(
+        symbols=[("ext_foo", 0, 0)],
+        relocs=[{"offset": PIE_RODATA2_VADDR, "sym": 1, "type": 6, "addend": 0}],
+    )
+
+
 def check_http_smoke() -> None:
     step("3/3 HTTP 冒烟")
     wait_for_health()
@@ -249,6 +285,79 @@ def check_http_smoke() -> None:
     if status != 200 or stored.get("ok"):
         fail("溢出记录不应包含成功结论/部分补丁")
     print("verify: PC32 有符号 32 位溢出已拒绝，未生成部分结果")
+
+    # 场景 d：ET_DYN(PIE) RELATIVE + GLOB_DAT 动态重定位成功
+    payload_d = {
+        "audit_id": "verify-pie-ok",
+        "file_base64": b64(pie_ok_elf()),
+        "load_base": PIE_BIAS,
+        "symbols": {"ext_foo": 0x500000},
+    }
+    status, body_d = http_post("/api/audit", payload_d)
+    if status != 200 or not body_d.get("ok"):
+        fail(f"PIE 动态重定位应成功：HTTP {status} {body_d}")
+    if body_d.get("file_kind") != "ET_DYN":
+        fail(f"file_kind 应为 ET_DYN：{body_d.get('file_kind')}")
+    if len(body_d.get("items", [])) != 3:
+        fail(f"PIE 应返回 3 个动态重定位项，实际 {len(body_d.get('items', []))}")
+    types = sorted(it["type_name"] for it in body_d["items"])
+    if types != ["R_X86_64_GLOB_DAT", "R_X86_64_GLOB_DAT", "R_X86_64_RELATIVE"]:
+        fail(f"PIE 重定位类型集合异常：{types}")
+    by_va = {it["vaddr_hex"]: it for it in body_d["items"]}
+    rel = next(it for it in body_d["items"] if it["type_name"] == "R_X86_64_RELATIVE")
+    # RELATIVE: B + A
+    if rel["value"] != f"0x{PIE_BIAS + PIE_TEXT_AT + 0x10:016x}":
+        fail(f"RELATIVE 计算值错误：{rel['value']}")
+    glob_ext = by_va[f"0x{PIE_TEXT_AT + 0x08:016x}"]
+    if glob_ext["value"] != f"0x{0x500020:016x}":
+        fail(f"GLOB_DAT 外部符号计算值错误：{glob_ext['value']}")
+    glob_loc = by_va[f"0x{PIE_TEXT_AT + 0x10:016x}"]
+    if glob_loc["value"] != f"0x{PIE_BIAS + PIE_TEXT_AT + 0x20 - 8:016x}":
+        fail(f"GLOB_DAT 映像内符号计算值错误：{glob_loc['value']}")
+    for it in body_d["items"]:
+        for key in ("vaddr_hex", "file_offset_hex", "runtime_addr", "mapping",
+                    "A", "P", "value", "before_hex", "after_hex"):
+            if key not in it:
+                fail(f"PIE 成功结果缺少字段 {key}")
+        # 运行地址 = 装载偏移 + 链接虚拟地址
+        va = int(it["vaddr_hex"], 16)
+        if int(it["runtime_addr"], 16) != (PIE_BIAS + va) & ((1 << 64) - 1):
+            fail(f"运行地址与 B+VA 不一致：{it}")
+        # 文件偏移 = 可执行段文件起点 + (VA - 段 VA 起点)
+        seg = body_d["exec_segment"]
+        expect_fo = int(seg["file_offset"], 16) + (va - int(seg["vaddr_start"], 16))
+        if it["file_offset"] != expect_fo:
+            fail(f"文件偏移与 vaddr 映射不一致：{it}")
+    vas = [p["vaddr"] for p in body_d["patches"]]
+    if vas != sorted(vas):
+        fail("PIE 补丁未按写入虚拟地址排序")
+    if len(body_d.get("conclusion", "")) != 64:
+        fail("PIE 冻结结论 SHA-256 缺失")
+    status, fetched_d = http_get("/api/result/verify-pie-ok")
+    if status != 200 or fetched_d.get("conclusion") != body_d["conclusion"]:
+        fail("PIE 冻结结论无法按标识读回或不一致")
+    print(f"verify: PIE RELATIVE/GLOB_DAT 动态重定位成功，结论 {body_d['conclusion']}")
+
+    # 场景 e：跨映射目标（写入 r-- 非可执行 PT_LOAD）拒绝，且清除旧结论
+    payload_e = {
+        "audit_id": "verify-pie-ok",  # 故意复用 d 的标识：旧 PASS 必须被清除
+        "file_base64": b64(pie_cross_mapping_elf()),
+        "load_base": PIE_BIAS,
+        "symbols": {"ext_foo": 0x500000},
+    }
+    status, body_e = http_post("/api/audit", payload_e)
+    if status != 200 or body_e.get("ok"):
+        fail(f"跨映射目标应被拒绝：HTTP {status} {body_e}")
+    if body_e["violation"]["code"] != "target_not_executable":
+        fail(f"违约代码应为 target_not_executable：{body_e['violation']}")
+    if body_e["violation"].get("entry_index") != 0:
+        fail("跨映射违约未定位到首个违约项（entry_index 应为 0）")
+    if "conclusion" in body_e:
+        fail("PIE 拒绝响应中不得携带旧冻结结论")
+    status, again_e = http_get("/api/result/verify-pie-ok")
+    if status != 200 or again_e.get("ok") or "conclusion" in again_e:
+        fail("PIE 旧成功结论未被清除")
+    print("verify: PIE 跨映射目标已拒绝（target_not_executable），旧成功结论已清除")
 
 
 def main() -> None:

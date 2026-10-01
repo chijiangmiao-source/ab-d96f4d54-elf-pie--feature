@@ -88,8 +88,9 @@ class FileLevelRejectionTests(unittest.TestCase):
     def test_bad_endian(self):
         self.assertReject(build_elf(ei_data=2), "bad_data")
 
-    def test_not_rel(self):
-        self.assertReject(build_elf(e_type=2), "bad_type")
+    def test_not_rel_or_dyn(self):
+        # ET_EXEC(3) 既不是 ET_REL 也不是 ET_DYN（PIE），整体拒绝
+        self.assertReject(build_elf(e_type=3), "bad_type")
 
     def test_bad_machine(self):
         self.assertReject(build_elf(e_machine=40), "bad_machine")
@@ -640,3 +641,374 @@ class HttpSmokeTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# ===========================================================================
+# ET_DYN / PIE 动态重定位（R_X86_64_RELATIVE / R_X86_64_GLOB_DAT）
+# ===========================================================================
+
+from elfbuild import (  # noqa: E402
+    PIE_TEXT_AT,
+    PIE_RODATA2_VADDR,
+    PIE_EXTRA_EXEC_VADDR,
+    build_pie,
+)
+
+PIE_BIAS = 0x7F000000
+PIE_SYMS = {"ext_foo": 0x500000, "ext_bar": 0x600100}
+
+
+def pie_payload(
+    data: bytes,
+    audit_id: str = "pie-1",
+    *,
+    bias: int = PIE_BIAS,
+    symbols: dict | None = None,
+) -> dict:
+    return {
+        "audit_id": audit_id,
+        "file_base64": base64.b64encode(data).decode(),
+        "load_base": bias,
+        "symbols": {} if symbols is None else dict(symbols),
+    }
+
+
+def pie_relative_globdat() -> bytes:
+    """RELATIVE + GLOB_DAT(外部) + GLOB_DAT(映像内定义) 三项，互不重叠。"""
+    return build_pie(
+        text=bytes(range(64)),
+        symbols=[
+            ("ext_foo", 0, 0),
+            ("local_fn", 1, PIE_TEXT_AT + 0x20),
+        ],
+        relocs=[
+            {"offset": PIE_TEXT_AT + 0x00, "sym": 0, "type": 8, "addend": PIE_TEXT_AT + 0x10},
+            {"offset": PIE_TEXT_AT + 0x08, "sym": 1, "type": 6, "addend": 0x20},
+            {"offset": PIE_TEXT_AT + 0x10, "sym": 2, "type": 6, "addend": -8},
+        ],
+    )
+
+
+class PieSuccessTests(unittest.TestCase):
+    def test_relative_and_globdat_success(self):
+        data = pie_relative_globdat()
+        r = elfaudit.audit(data, PIE_BIAS, {"ext_foo": 0x500000})
+        self.assertTrue(r.ok, r.violation)
+        self.assertEqual(r.file_kind, "ET_DYN")
+        self.assertEqual(len(r.items), 3)
+
+        by_va = {it.offset: it for it in r.items}
+        rel = by_va[PIE_TEXT_AT + 0x00]
+        g_ext = by_va[PIE_TEXT_AT + 0x08]
+        g_loc = by_va[PIE_TEXT_AT + 0x10]
+
+        # R_X86_64_RELATIVE: value = B + A
+        self.assertEqual(rel.reloc_type, 8)
+        self.assertEqual(rel.value, PIE_BIAS + PIE_TEXT_AT + 0x10)
+        self.assertEqual(rel.after, struct.pack("<Q", rel.value))
+        # RELATIVE 无符号引用：公开字典 S 为空，symbol 为空串
+        self.assertEqual(rel.symbol, "")
+        rel_pub = next(it for it in r.to_public_dict()["items"]
+                       if it["vaddr"] == PIE_TEXT_AT + 0x00)
+        self.assertIsNone(rel_pub["S"])
+
+        # R_X86_64_GLOB_DAT 外部符号: value = S + A
+        self.assertEqual(g_ext.reloc_type, 6)
+        self.assertEqual(g_ext.symbol, "ext_foo")
+        self.assertEqual(g_ext.s, 0x500000)
+        self.assertEqual(g_ext.value, 0x500020)
+        self.assertEqual(g_ext.a, 0x20)
+
+        # GLOB_DAT 映像内定义符号: S = B + st_value, value = S + A
+        self.assertEqual(g_loc.s, PIE_BIAS + PIE_TEXT_AT + 0x20)
+        self.assertEqual(g_loc.value, PIE_BIAS + PIE_TEXT_AT + 0x20 - 8)
+
+    def test_vaddr_to_file_offset_mapping_and_runtime_addr(self):
+        data = pie_relative_globdat()
+        r = elfaudit.audit(data, PIE_BIAS, {"ext_foo": 0x500000})
+        self.assertTrue(r.ok, r.violation)
+        seg = r.exec_segment
+        self.assertEqual(seg["perms"], "r-x")
+        v0 = PIE_TEXT_AT
+        for it in r.items:
+            # 文件偏移 = 段偏移 + (vaddr - 段 vaddr 起点)
+            expect_file = (v0 - 0x1000) + (it.offset - v0)
+            self.assertEqual(it.file_offset, expect_file)
+            # 运行地址 = 装载偏移 + 链接虚拟地址
+            self.assertEqual(it.p, (PIE_BIAS + it.offset) & ((1 << 64) - 1))
+            self.assertTrue(it.mapping.startswith("PT_LOAD#0"))
+        # 写前字节取自文件，写后字节与补丁后映像摘要一致
+        first = sorted(r.items, key=lambda x: x.offset)[0]
+        self.assertEqual(first.before, bytes(range(8)))
+        self.assertEqual(first.after, struct.pack("<Q", first.value))
+        patched = bytearray(data[0:0x1000])
+        for it in r.items:
+            patched[it.file_offset : it.file_offset + 8] = it.after
+        import hashlib
+
+        self.assertEqual(r.patched, bytes(patched))
+        self.assertEqual(r.patched_sha256, hashlib.sha256(bytes(patched)).hexdigest())
+
+    def test_public_dict_shape_sorted_by_vaddr(self):
+        data = pie_relative_globdat()
+        r = elfaudit.audit(data, PIE_BIAS, {"ext_foo": 0x500000})
+        pub = r.to_public_dict()
+        self.assertEqual(pub["file_kind"], "ET_DYN")
+        self.assertIn("load_bias", pub)
+        self.assertIn("exec_segment", pub)
+        self.assertEqual(pub["segment_size"], 0x1000)
+        vas = [p["vaddr"] for p in pub["patches"]]
+        self.assertEqual(vas, sorted(vas))
+        for it in pub["items"]:
+            for key in ("vaddr_hex", "file_offset_hex", "runtime_addr",
+                        "mapping", "A", "P", "value", "before_hex", "after_hex"):
+                self.assertIn(key, it)
+        # 补丁清单按写入虚拟地址稳定展示
+        self.assertEqual(pub["patches"][0]["vaddr"], PIE_TEXT_AT)
+
+    def test_write_exact_segment_end_is_valid(self):
+        # 0x1ff8 起 8 字节恰好落在可执行段 [0x1000,0x2000) 内
+        data = build_pie(relocs=[{"offset": 0x1FF8, "sym": 0, "type": 8, "addend": 0}])
+        r = elfaudit.audit(data, PIE_BIAS, {})
+        self.assertTrue(r.ok, r.violation)
+        self.assertEqual(r.items[0].file_offset, 0xFF8)
+
+    def test_stripped_section_table_still_audited(self):
+        data = build_pie(
+            strip_section_table=True,
+            symbols=[("ext_foo", 0, 0)],
+            relocs=[{"offset": PIE_TEXT_AT, "sym": 1, "type": 6, "addend": 0}],
+        )
+        r = elfaudit.audit(data, PIE_BIAS, {"ext_foo": 0x500000})
+        self.assertTrue(r.ok, r.violation)
+        self.assertEqual(r.items[0].value, 0x500000)
+
+    def test_freeze_conclusion_stable_and_bias_sensitive(self):
+        data = pie_relative_globdat()
+        syms = {"ext_foo": 0x500000}
+        c1 = elfaudit.freeze_conclusion("pie-id", elfaudit.audit(data, PIE_BIAS, syms), syms)
+        c2 = elfaudit.freeze_conclusion("pie-id", elfaudit.audit(data, PIE_BIAS, syms), syms)
+        self.assertEqual(c1, c2)
+        self.assertEqual(len(c1), 64)
+        c3 = elfaudit.freeze_conclusion(
+            "pie-id", elfaudit.audit(data, PIE_BIAS + 1, syms), syms
+        )
+        self.assertNotEqual(c1, c3)
+        c4 = elfaudit.freeze_conclusion("pie-id2", elfaudit.audit(data, PIE_BIAS, syms), syms)
+        self.assertNotEqual(c1, c4)
+
+
+class PieRejectionTests(unittest.TestCase):
+    def assertPieReject(self, data, code, *, symbols=None, bias=PIE_BIAS):
+        r = elfaudit.audit(data, bias, dict(PIE_SYMS if symbols is None else symbols))
+        self.assertFalse(r.ok)
+        self.assertEqual(r.items, [])
+        self.assertEqual(r.patched, b"")
+        self.assertEqual(r.patched_sha256, "")
+        self.assertEqual(r.violation.code, code)
+        return r.violation
+
+    def test_cross_mapping_readonly_target_rejected(self):
+        data = build_pie(
+            symbols=[("ext_foo", 0, 0)],
+            relocs=[{"offset": PIE_RODATA2_VADDR, "sym": 1, "type": 6, "addend": 0}],
+        )
+        v = self.assertPieReject(data, "target_not_executable",
+                                 symbols={"ext_foo": 0x500000})
+        self.assertEqual(v.entry_index, 0)
+        self.assertEqual(v.detail["target_segment"], 1)
+        self.assertEqual(v.detail["exec_segment"], 0)
+
+    def test_cross_mapping_data_target_rejected(self):
+        data = build_pie(
+            symbols=[("ext_foo", 0, 0)],
+            relocs=[{"offset": 0x4000, "sym": 1, "type": 6, "addend": 0}],
+        )
+        self.assertPieReject(data, "target_not_executable",
+                             symbols={"ext_foo": 0x500000})
+
+    def test_unmapped_target_rejected(self):
+        data = build_pie(
+            symbols=[("ext_foo", 0, 0)],
+            relocs=[{"offset": 0x9000, "sym": 1, "type": 6, "addend": 0}],
+        )
+        v = self.assertPieReject(data, "unmapped_target",
+                                 symbols={"ext_foo": 0x500000})
+        self.assertEqual(v.entry_index, 0)
+
+    def test_write_spanning_segment_boundary_rejected(self):
+        # 8 字节写从 0x1ffc 起，跨过可执行段结束边界
+        data = build_pie(relocs=[{"offset": 0x1FFC, "sym": 0, "type": 8, "addend": 0}])
+        self.assertPieReject(data, "unmapped_target")
+
+    def test_two_executable_segments_rejected(self):
+        data = build_pie(
+            extra_exec_load=True,
+            symbols=[("ext_foo", 0, 0)],
+            relocs=[{"offset": PIE_TEXT_AT, "sym": 1, "type": 6}],
+        )
+        self.assertPieReject(data, "executable_segment_not_unique",
+                             symbols={"ext_foo": 0x500000})
+
+    def test_no_executable_segment_rejected(self):
+        data = build_pie(
+            target_exec_flags=4,  # r-- 唯一可执行属性消失
+            symbols=[("ext_foo", 0, 0)],
+            relocs=[{"offset": PIE_TEXT_AT, "sym": 1, "type": 6}],
+        )
+        self.assertPieReject(data, "no_executable_segment",
+                             symbols={"ext_foo": 0x500000})
+
+    def test_unsupported_reloc_type_locates_first(self):
+        data = build_pie(
+            symbols=[("ext_foo", 0, 0)],
+            relocs=[{"offset": PIE_TEXT_AT, "sym": 1, "type": 1, "addend": 0}],
+        )
+        v = self.assertPieReject(data, "unsupported_reloc_type",
+                                 symbols={"ext_foo": 0x500000})
+        self.assertEqual(v.entry_index, 0)
+
+    def test_unresolved_external_symbol(self):
+        data = build_pie(
+            symbols=[("ext_foo", 0, 0)],
+            relocs=[{"offset": PIE_TEXT_AT, "sym": 1, "type": 6}],
+        )
+        v = self.assertPieReject(data, "unresolved_symbol", symbols={})
+        self.assertEqual(v.symbol, "ext_foo")
+        self.assertEqual(v.entry_index, 0)
+
+    def test_bad_symbol_index(self):
+        data = build_pie(
+            symbols=[("ext_foo", 0, 0)],
+            relocs=[{"offset": PIE_TEXT_AT, "sym": 99, "type": 6}],
+        )
+        v = self.assertPieReject(data, "bad_symbol_index",
+                                 symbols={"ext_foo": 0x500000})
+        self.assertEqual(v.entry_index, 0)
+
+    def test_unexpected_extra_symbol(self):
+        data = build_pie(
+            symbols=[("ext_foo", 0, 0)],
+            relocs=[{"offset": PIE_TEXT_AT, "sym": 1, "type": 6}],
+        )
+        self.assertPieReject(data, "unexpected_symbol",
+                             symbols={"ext_foo": 0x500000, "ghost": 1})
+
+    def test_patch_overlap_rejected(self):
+        data = build_pie(
+            symbols=[("ext_foo", 0, 0)],
+            relocs=[
+                {"offset": PIE_TEXT_AT, "sym": 0, "type": 8, "addend": 1},
+                {"offset": PIE_TEXT_AT + 4, "sym": 1, "type": 6, "addend": 0},
+            ],
+        )
+        v = self.assertPieReject(data, "patch_overlap",
+                                 symbols={"ext_foo": 0x500000})
+        self.assertEqual(v.entry_index, 1)
+        self.assertEqual(v.detail["conflicts_with"], 0)
+
+    def test_first_violation_reported(self):
+        # 第 0 项合法、第 1 项无映射；必须定位第 1 项
+        data = build_pie(
+            symbols=[("ext_foo", 0, 0)],
+            relocs=[
+                {"offset": PIE_TEXT_AT, "sym": 1, "type": 6, "addend": 0},
+                {"offset": 0x9000, "sym": 1, "type": 6, "addend": 0},
+            ],
+        )
+        v = self.assertPieReject(data, "unmapped_target",
+                                 symbols={"ext_foo": 0x500000})
+        self.assertEqual(v.entry_index, 1)
+
+    def test_rela_table_unmapped_rejected(self):
+        data = build_pie(
+            rela_vaddr_override=0x9000,
+            symbols=[("ext_foo", 0, 0)],
+            relocs=[{"offset": PIE_TEXT_AT, "sym": 1, "type": 6}],
+        )
+        self.assertPieReject(data, "dynamic_pointer_unmapped",
+                             symbols={"ext_foo": 0x500000})
+
+    def test_rela_table_out_of_bounds_locates_first_bad_entry(self):
+        data = build_pie(
+            rela_size_override=24 * 500,
+            symbols=[("ext_foo", 0, 0)],
+            relocs=[{"offset": PIE_TEXT_AT, "sym": 1, "type": 6}],
+        )
+        v = self.assertPieReject(data, "rela_entry_out_of_bounds",
+                                 symbols={"ext_foo": 0x500000})
+        # 可执行页映射内可容纳的 RELA 项之后的首项即首个越界表项
+        self.assertEqual(v.stage, "entry")
+        self.assertIsNotNone(v.entry_index)
+
+    def test_rela_entry_truncated_locates_first_bad_entry(self):
+        data = build_pie(
+            rela_size_override=20,
+            symbols=[("ext_foo", 0, 0)],
+            relocs=[{"offset": PIE_TEXT_AT, "sym": 1, "type": 6}],
+        )
+        v = self.assertPieReject(data, "rela_entry_truncated",
+                                 symbols={"ext_foo": 0x500000})
+        self.assertEqual(v.entry_index, 0)
+        self.assertEqual(v.stage, "entry")
+
+    def test_dynamic_segment_unmapped_rejected(self):
+        data = build_pie(
+            dynamic_in_nonload=True,
+            symbols=[("ext_foo", 0, 0)],
+            relocs=[{"offset": PIE_TEXT_AT, "sym": 1, "type": 6}],
+        )
+        self.assertPieReject(data, "dynamic_unmapped",
+                             symbols={"ext_foo": 0x500000})
+
+    def test_dt_rel_rejected(self):
+        data = build_pie(
+            add_dt_rel=True,
+            symbols=[("ext_foo", 0, 0)],
+            relocs=[{"offset": PIE_TEXT_AT, "sym": 1, "type": 6}],
+        )
+        self.assertPieReject(data, "rel_unsupported",
+                             symbols={"ext_foo": 0x500000})
+
+    def test_no_phdr_and_no_dynamic(self):
+        kw = dict(
+            symbols=[("ext_foo", 0, 0)],
+            relocs=[{"offset": PIE_TEXT_AT, "sym": 1, "type": 6}],
+        )
+        self.assertPieReject(build_pie(no_phdr=True, **kw), "program_header_required",
+                             symbols={"ext_foo": 0x500000})
+        self.assertPieReject(build_pie(no_dynamic=True, **kw), "no_dynamic_segment",
+                             symbols={"ext_foo": 0x500000})
+
+
+class PieApiTests(unittest.TestCase):
+    def setUp(self):
+        from app import server
+
+        server._store.clear()
+
+    def test_pie_success_via_api(self):
+        rec = run_audit(pie_payload(pie_relative_globdat(), "pie-api",
+                                    symbols={"ext_foo": 0x500000}))
+        self.assertTrue(rec["ok"])
+        self.assertEqual(rec["file_kind"], "ET_DYN")
+        self.assertEqual(len(rec["conclusion"]), 64)
+        self.assertEqual(len(rec["items"]), 3)
+
+    def test_pie_failure_clears_previous_success(self):
+        syms = {"ext_foo": 0x500000}
+        ok = run_audit(pie_payload(pie_relative_globdat(), "pie-stable", symbols=syms))
+        self.assertTrue(ok["ok"])
+        bad = build_pie(
+            symbols=[("ext_foo", 0, 0)],
+            relocs=[{"offset": 0x9000, "sym": 1, "type": 6}],
+        )
+        fail = run_audit(pie_payload(bad, "pie-stable", symbols=syms))
+        self.assertFalse(fail["ok"])
+        self.assertEqual(fail["violation"]["code"], "unmapped_target")
+        self.assertNotIn("conclusion", fail)
+        from app import server
+
+        stored = server._store["pie-stable"]
+        self.assertEqual(stored["kind"], "fail")
+        self.assertNotIn("result", stored)

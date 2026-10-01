@@ -52,6 +52,8 @@
   .muted { color: var(--mut); }
   .tag { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11px; border: 1px solid var(--line); }
   .tag.r1 { color: #d2a8ff; } .tag.r2 { color: #ffa657; }
+  .tag.r6 { color: #d2a8ff; } .tag.r8 { color: #56d364; }
+  .tag.rx { color: #56d364; border-color: var(--ok); } .tag.other { color: var(--mut); }
   .viol-table td:first-child { color: var(--mut); white-space: nowrap; }
   pre.hex { background: var(--panel2); border: 1px solid var(--line); border-radius: 6px; padding: 10px;
             font-family: var(--mono); font-size: 11.5px; overflow:auto; max-height: 260px; white-space: pre; margin: 8px 0 0; }
@@ -62,7 +64,7 @@
 <body>
 <header>
   <h1>ELF64 重定位载荷审计台</h1>
-  <p>仅接受 ELF64 小端 ET_REL（EM_X86_64）：唯一 <code>.text</code>、指向它的 RELA、R_X86_64_64 / R_X86_64_PC32。失败时定位首个违约项并清除旧成功结论，绝不返回部分补丁。</p>
+  <p>接受 ELF64 小端 x86-64 的 <strong>ET_REL</strong>（唯一 <code>.text</code>、指向它的 RELA、R_X86_64_64 / R_X86_64_PC32）与已链接的 <strong>ET_DYN（PIE）</strong>（PT_DYNAMIC 的 RELA 表，R_X86_64_RELATIVE / R_X86_64_GLOB_DAT，仅允许写入唯一可执行 PT_LOAD）。失败时定位首个违约项并清除旧成功结论，绝不返回部分补丁。</p>
 </header>
 <main>
   <section class="card">
@@ -70,11 +72,11 @@
     <label for="auditId">稳定审计标识（audit_id）</label>
     <input type="text" id="auditId" placeholder="如 payload-2026-09-29-001" autocomplete="off">
 
-    <label for="fileInput">供应商交付的可重定位目标文件（.o）</label>
+    <label for="fileInput">供应商交付文件（ET_REL .o，或已链接的 ET_DYN / PIE 映像）</label>
     <input type="file" id="fileInput">
     <div class="filemeta" id="fileMeta">未选择文件</div>
 
-    <label for="loadBase">代码装载基址（十进制或 0x 十六进制）</label>
+    <label for="loadBase">代码装载基址 / PIE 装载偏移 B（十进制或 0x 十六进制）</label>
     <input type="text" id="loadBase" placeholder="0x400000">
 
     <label>被引用外部符号地址</label>
@@ -168,7 +170,7 @@ function renderFail(v) {
   push("首个违约项序号 entry_index", v.entry_index);
   push("所在 RELA 节", v.rela_section);
   push("节内 RELA 下标 rela_index", v.rela_index);
-  push(".text 写入偏移", v.offset);
+  push("写入偏移（ET_REL .text 偏移 / PIE 虚拟地址）", v.offset);
   push("重定位类型", v.type_name);
   push("符号", v.symbol);
   if (v.detail) push("明细 detail", JSON.stringify(v.detail));
@@ -177,7 +179,47 @@ function renderFail(v) {
     <table class="viol-table">${rows.join("")}</table>`;
 }
 
-function renderPass(r) {
+function renderPiePass(r) {
+  const seg = r.exec_segment || {};
+  const items = r.items.map((it) => `
+    <tr>
+      <td>${it.index}</td>
+      <td>${esc(it.vaddr_hex)}<div class="muted">文件 ${esc(it.file_offset_hex)}</div></td>
+      <td><span class="tag ${it.type === 8 ? "r8" : "r6"}">${esc(it.type_name)}</span></td>
+      <td>${it.symbol ? `<span class="sym">${esc(it.symbol)}</span><div class="muted">sym#${it.symbol_index}</div>` : '<span class="muted">—（相对重定位）</span>'}</td>
+      <td>${it.S === null || it.S === undefined ? '<span class="muted">—</span>' : esc(it.S)}</td>
+      <td>${esc(it.A)}<div class="muted">${esc(it.A_hex)}</div></td>
+      <td>${esc(it.P)}<div class="muted">运行地址 = B+VA</div></td>
+      <td>${esc(it.value)}</td>
+      <td><span class="tag ${seg.perms === "r-x" ? "rx" : "other"}">${esc(seg.perms || "")}</span><div class="muted">${esc(it.mapping || "")}</div></td>
+      <td class="bytes-before">${esc(it.before_hex)}</td>
+      <td class="bytes-after">${esc(it.after_hex)}</td>
+    </tr>`).join("");
+  const patches = r.patches.map((p) =>
+    `VA ${p.vaddr_hex}  文件 ${p.file_offset_hex}  运行 ${p.runtime_addr}  +${p.width}  ${p.type_name}  ${p.symbol || "—"}  ${p.before_hex} -> ${p.after_hex}`).join("\n");
+  return `<div class="banner pass"><div class="verdict">✓ PIE 动态重定位审计通过（PASS）— 结论已冻结</div>
+    <div>所有补丁均落在唯一可执行映射 <code>${esc(seg.perms || "")}</code> ${esc(seg.vaddr_start || "")}..${esc(seg.vaddr_end || "")}（文件偏移 ${esc(seg.file_offset || "")}），按写入虚拟地址排序。</div></div>
+  <div class="kv">
+    <span class="k">审计标识</span><span>${esc(r.audit_id)}</span>
+    <span class="k">文件形态</span><span>ET_DYN（PIE）</span>
+    <span class="k">冻结结论 SHA-256</span><span>${esc(r.conclusion)}</span>
+    <span class="k">原始文件 SHA-256</span><span>${esc(r.file_sha256)}</span>
+    <span class="k">装载偏移 B</span><span>${esc(r.load_bias)}</span>
+    <span class="k">唯一可执行映射</span><span>PT_LOAD#${seg.index ?? ""} ${esc(seg.perms || "")} VA ${esc(seg.vaddr_start || "")} → 文件 ${esc(seg.file_offset || "")}（${seg.file_size ?? 0} 字节）</span>
+    <span class="k">补丁前映射 SHA-256</span><span>${esc(r.segment_sha256_before)}</span>
+    <span class="k">重定位后映射摘要 SHA-256</span><span>${esc(r.patched_sha256)}</span>
+    <span class="k">重定位项数</span><span>${r.item_count}</span>
+  </div>
+  <details open><summary>逐项复算（写入虚拟地址 VA ↔ 文件偏移 ↔ 运行地址 B+VA；S 符号地址 / A 加数 / P 运行写入位置 / 计算值 / 所属映射 / 写入前后字节）</summary>
+    <table>
+      <thead><tr><th>项</th><th>写入虚拟地址 / 文件偏移</th><th>类型</th><th>符号</th><th>S</th><th>A</th><th>P（运行地址）</th><th>计算值</th><th>所属映射</th><th>写入前</th><th>写入后</th></tr></thead>
+      <tbody>${items || '<tr><td colspan="11" class="muted">无重定位项</td></tr>'}</tbody>
+    </table>
+  </details>
+  <details><summary>按写入虚拟地址排序的字节补丁清单（含文件偏移与运行地址）</summary><pre class="hex">${esc(patches) || "（无）"}</pre></details>`;
+}
+
+function renderRelPass(r) {
   const items = r.items.map((it, n) => `
     <tr>
       <td>${n + 1}</td>
@@ -196,6 +238,7 @@ function renderPass(r) {
   return `<div class="banner pass"><div class="verdict">✓ 审计通过（PASS）— 结论已冻结</div></div>
   <div class="kv">
     <span class="k">审计标识</span><span>${esc(r.audit_id)}</span>
+    <span class="k">文件形态</span><span>ET_REL（可重定位目标）</span>
     <span class="k">冻结结论 SHA-256</span><span>${esc(r.conclusion)}</span>
     <span class="k">原始文件 SHA-256</span><span>${esc(r.file_sha256)}</span>
     <span class="k">装载基址</span><span>${esc(r.load_base)}</span>
@@ -212,6 +255,10 @@ function renderPass(r) {
   </details>
   <details><summary>按偏移排序的字节补丁清单</summary><pre class="hex">${esc(patches) || "（无）"}</pre></details>
   <details><summary>重定位后 .text 十六进制转储</summary><pre class="hex">${esc(hexDump(r.patched_text_hex))}</pre></details>`;
+}
+
+function renderPass(r) {
+  return r.file_kind === "ET_DYN" ? renderPiePass(r) : renderRelPass(r);
 }
 
 function render(r) {
