@@ -1,4 +1,4 @@
-"""测试夹具：在内存中手工构造 ELF64 小端 ET_REL 文件，不依赖外部工具链。"""
+"""测试夹具：在内存中手工构造 ELF64 小端 ET_REL / ET_DYN 文件，不依赖外部工具链。"""
 
 from __future__ import annotations
 
@@ -11,10 +11,28 @@ SHT_RELA = 4
 SHT_REL = 9
 
 ET_REL = 1
+ET_DYN = 3
 EM_X86_64 = 62
 
 R_X86_64_64 = 1
 R_X86_64_PC32 = 2
+R_X86_64_GLOB_DAT = 6
+R_X86_64_RELATIVE = 8
+
+PT_LOAD = 1
+PT_DYNAMIC = 2
+PF_R = 4
+PF_W = 2
+PF_X = 1
+
+DT_NULL = 0
+DT_STRTAB = 5
+DT_SYMTAB = 6
+DT_RELA = 7
+DT_RELASZ = 8
+DT_RELAENT = 9
+DT_STRSZ = 10
+DT_SYMENT = 11
 
 STB_GLOBAL = 1
 STT_NOTYPE = 0
@@ -202,5 +220,148 @@ def build_elf(
             sec.get("entsize", 0),
         )
         out[shoff + i * 64 : shoff + (i + 1) * 64] = shdr
+
+    return bytes(out)
+
+
+# ---------------------------------------------------------------------------
+# ET_DYN / PIE 映像构造
+# ---------------------------------------------------------------------------
+
+# 固定布局常量，测试用例据此构造 r_offset 目标
+PIE_CODE_VADDR = 0x200
+PIE_DATA_VADDR = 0x4000
+_PIE_CODE_OFF = 0x200
+_PIE_DATA_VADDR = 0x4000
+_PIE_PAGE = 0x1000
+
+
+def _align8(pos: int) -> int:
+    return (pos + 7) & ~7
+
+
+def build_pie(
+    *,
+    code: bytes | None = b"\x90" * 64,
+    data: bytes | None = b"\x00" * 32,
+    bss_size: int = 0,
+    dyn_relocs: list[dict] | None = None,
+    dynsyms: list[tuple[str, int, int]] | None = None,
+    omit_tags: tuple[int, ...] = (),
+    relaent: int = 24,
+    syment: int = 24,
+    relasz_override: int | None = None,
+    dynamic_terminated: bool = True,
+    no_exec: bool = False,
+    data_executable: bool = False,
+    second_dynamic: bool = False,
+    tag_overrides: dict[int, int] | None = None,
+) -> bytes:
+    """构造一个最小化 ET_DYN（PIE）映像。
+
+    布局：可执行 PT_LOAD（文件偏移 0 / vaddr 0，内含 ELF 头、程序头、代码、
+    RELA、dynsym、dynstr、.dynamic）；可选 RW PT_LOAD（vaddr 0x4000，
+    data 后接 bss）；PT_DYNAMIC 位于可执行段内。
+
+    dyn_relocs 每项 ``{"offset": 虚拟地址, "sym": 符号索引, "type", "addend"}``；
+    dynsyms 每项 ``(名称, st_shndx, st_value)``，符号表 0 号为保留空符号。
+    """
+    dyn_relocs = dyn_relocs or []
+    dynsyms = dynsyms or []
+
+    # ---- dynstr / dynsym / rela 字节流 ----
+    dynstr = bytearray(b"\x00")
+    name_offsets: list[int] = []
+    for nm, _shndx, _val in dynsyms:
+        name_offsets.append(len(dynstr))
+        dynstr += nm.encode("latin-1") + b"\x00"
+
+    dynsym = bytearray(b"\x00" * 24)
+    for i, (_nm, shndx, value) in enumerate(dynsyms):
+        info = (STB_GLOBAL << 4) | STT_NOTYPE
+        dynsym += struct.pack("<IBBHQQ", name_offsets[i], info, 0, shndx, value, 0)
+
+    rela = bytearray()
+    for r in dyn_relocs:
+        r_info = (r["sym"] << 32) | (r["type"] & 0xFFFFFFFF)
+        rela += struct.pack("<QQq", r["offset"], r_info, r.get("addend", 0))
+
+    # ---- 内容在可执行段内的偏移（vaddr == 文件偏移）----
+    rela_off = _align8(_PIE_CODE_OFF + len(code))
+    dynsym_off = _align8(rela_off + len(rela))
+    dynstr_off = _align8(dynsym_off + len(dynsym))
+    dynamic_off = _align8(dynstr_off + len(dynstr))
+
+    # ---- .dynamic 条目 ----
+    tags: list[tuple[int, int]] = [
+        (DT_STRTAB, dynstr_off),
+        (DT_SYMTAB, dynsym_off),
+        (DT_RELA, rela_off),
+        (DT_RELASZ, relasz_override if relasz_override is not None else len(rela)),
+        (DT_RELAENT, relaent),
+        (DT_STRSZ, len(dynstr)),
+        (DT_SYMENT, syment),
+    ]
+    tags = [(t, v) for (t, v) in tags if t not in omit_tags]
+    for t, v in (tag_overrides or {}).items():
+        tags = [(tt, vv) for (tt, vv) in tags if tt != t] + [(t, v)]
+    if dynamic_terminated:
+        tags.append((DT_NULL, 0))
+    dynamic = b"".join(struct.pack("<qQ", t, v) for t, v in tags)
+
+    exec_filesz = dynamic_off + len(dynamic)
+    data_off = (exec_filesz + _PIE_PAGE - 1) // _PIE_PAGE * _PIE_PAGE
+
+    has_data = data is not None
+    phnum = (1 if not has_data else 2) + 1 + (1 if second_dynamic else 0)
+    phoff = 64
+
+    out = bytearray(data_off + (len(data) if has_data else 0))
+
+    code_flags = (PF_R | PF_W) if no_exec else (PF_R | PF_X)
+    data_flags = (PF_R | PF_W | PF_X) if data_executable else (PF_R | PF_W)
+
+    phdrs: list[tuple] = []
+    phdrs.append(
+        (PT_LOAD, code_flags, 0, 0, 0, exec_filesz, exec_filesz, 0x1000)
+    )
+    if has_data:
+        memsz = len(data) + bss_size
+        phdrs.append(
+            (PT_LOAD, data_flags, data_off, _PIE_DATA_VADDR, _PIE_DATA_VADDR,
+             len(data), memsz, 0x1000)
+        )
+    phdrs.append(
+        (PT_DYNAMIC, PF_R | PF_X, dynamic_off, dynamic_off, dynamic_off,
+         len(dynamic), len(dynamic), 8)
+    )
+    if second_dynamic:
+        phdrs.append(
+            (PT_DYNAMIC, PF_R | PF_X, dynamic_off, dynamic_off, dynamic_off,
+             len(dynamic), len(dynamic), 8)
+        )
+
+    # ELF 头
+    ei = bytearray(16)
+    ei[0:4] = b"\x7fELF"
+    ei[4] = 2
+    ei[5] = 1
+    ei[6] = 1
+    ehdr = struct.pack(
+        "<16sHHIQQQIHHHHHH",
+        bytes(ei), ET_DYN, EM_X86_64, 1, _PIE_CODE_OFF, phoff, 0, 0,
+        64, 56, phnum, 0, 0, 0,
+    )
+    out[0:64] = ehdr
+    for i, p in enumerate(phdrs):
+        out[phoff + i * 56 : phoff + (i + 1) * 56] = struct.pack("<IIQQQQQQ", *p)
+
+    out[_PIE_CODE_OFF : _PIE_CODE_OFF + len(code)] = code
+    out[rela_off : rela_off + len(rela)] = rela
+    out[dynsym_off : dynsym_off + len(dynsym)] = dynsym
+    out[dynstr_off : dynstr_off + len(dynstr)] = dynstr
+    out[dynamic_off : dynamic_off + len(dynamic)] = dynamic
+    if has_data:
+        out[data_off : data_off + len(data)] = data
 
     return bytes(out)

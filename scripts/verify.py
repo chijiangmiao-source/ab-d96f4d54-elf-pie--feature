@@ -4,10 +4,14 @@
 
 1. 单元测试（``python -m unittest`` 全量）；
 2. 构建检查（全部源码字节编译 + 关键模块导入）；
-3. HTTP 冒烟（健康检查 + 三个必测场景）：
-   a. 双类型重定位（R_X86_64_64 + R_X86_64_PC32）成功并逐项返回 S/A/P；
-   b. 重叠写入被拒绝（patch_overlap）；
-   c. PC32 有符号 32 位溢出被拒绝（pc32_overflow），且无部分结果。
+3. HTTP 冒烟（健康检查 + 五个必测场景）：
+   a. ET_REL 双类型重定位（R_X86_64_64 + R_X86_64_PC32）成功并逐项返回 S/A/P；
+   b. ET_REL 重叠写入被拒绝（patch_overlap）；
+   c. ET_REL PC32 有符号 32 位溢出被拒绝（pc32_overflow），且无部分结果；
+   d. ET_DYN（PIE）动态重定位 R_X86_64_RELATIVE + R_X86_64_GLOB_DAT 成功，
+      逐项返回写入虚拟地址 / 文件偏移 / 所属唯一可执行映射；
+   e. ET_DYN 写入目标落在非可执行 PT_LOAD（跨映射）被拒绝
+      （target_not_executable），旧成功结论被清除，无部分结果。
 
 任何一步失败立即以非零退出码结束；全部成功退出码为 0。
 """
@@ -30,10 +34,14 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
 
-from elfbuild import build_elf  # noqa: E402
+from elfbuild import build_elf, build_pie  # noqa: E402
 
 BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:8080")
 TIMEOUT = 5
+
+PIE_BASE = 0x555555554000
+PIE_EXT_FOO = 0x7FFFF7A01000
+PIE_DATA_VADDR = 0x4000
 
 
 def step(name: str) -> None:
@@ -249,6 +257,92 @@ def check_http_smoke() -> None:
     if status != 200 or stored.get("ok"):
         fail("溢出记录不应包含成功结论/部分补丁")
     print("verify: PC32 有符号 32 位溢出已拒绝，未生成部分结果")
+
+    # 场景 d：ET_DYN（PIE）RELATIVE + GLOB_DAT 成功
+    pie = build_pie(
+        code=bytes(range(64)),
+        dynsyms=[("ext_foo", 0, 0)],
+        dyn_relocs=[
+            {"offset": 0x200, "sym": 0, "type": 8, "addend": 0x3000},
+            {"offset": 0x208, "sym": 1, "type": 6, "addend": 0x10},
+        ],
+    )
+    payload_d = {
+        "audit_id": "verify-pie-dynamic",
+        "file_base64": b64(pie),
+        "load_base": PIE_BASE,
+        "symbols": {"ext_foo": PIE_EXT_FOO},
+    }
+    status, body_d = http_post("/api/audit", payload_d)
+    if status != 200 or not body_d.get("ok"):
+        fail(f"PIE 动态重定位应成功：HTTP {status} {body_d}")
+    if body_d.get("elf_type") != "ET_DYN":
+        fail(f"响应 elf_type 应为 ET_DYN：{body_d.get('elf_type')}")
+    if len(body_d.get("items", [])) != 2:
+        fail(f"PIE 应返回 2 个动态重定位项，实际 {len(body_d.get('items', []))}")
+    types = sorted(it["type_name"] for it in body_d["items"])
+    if types != ["R_X86_64_GLOB_DAT", "R_X86_64_RELATIVE"]:
+        fail(f"动态重定位类型集合异常：{types}")
+    by_type = {it["type_name"]: it for it in body_d["items"]}
+    rel = by_type["R_X86_64_RELATIVE"]
+    glob = by_type["R_X86_64_GLOB_DAT"]
+    # RELATIVE: B + A
+    if rel["after_hex"] != struct.pack("<Q", PIE_BASE + 0x3000).hex():
+        fail(f"RELATIVE 写入值错误：{rel['after_hex']}")
+    # GLOB_DAT: S + A
+    if glob["after_hex"] != struct.pack("<Q", PIE_EXT_FOO + 0x10).hex():
+        fail(f"GLOB_DAT 写入值错误：{glob['after_hex']}")
+    # 稳定展示：写入虚拟地址 / 文件偏移 / 所属唯一可执行映射
+    for it, vaddr in ((rel, 0x200), (glob, 0x208)):
+        if int(it["vaddr"], 16) != vaddr:
+            fail(f"{it['type_name']} vaddr 应为 0x{vaddr:x}，实际 {it['vaddr']}")
+        if it["file_offset"] != vaddr:
+            fail(f"{it['type_name']} file_offset 应为 0x{vaddr:x}，实际 {it['file_offset_hex']}")
+        if it["mapping"] != body_d["exec_image"]["index"]:
+            fail(f"{it['type_name']} 未落入唯一可执行映射")
+        if int(it["P"], 16) != PIE_BASE + vaddr:
+            fail(f"{it['type_name']} 运行地址 P 应为 {PIE_BASE + vaddr:#x}，实际 {it['P']}")
+    if not body_d["exec_image"]["flags_str"].endswith("X"):
+        fail("exec_image 必须带 PF_X")
+    exec_indexes = [m["index"] for m in body_d["mappings"] if m["executable"]]
+    if exec_indexes != [body_d["exec_image"]["index"]]:
+        fail(f"可执行 PT_LOAD 必须唯一：{exec_indexes}")
+    vaddrs = [p["vaddr"] for p in body_d["patches"]]
+    if vaddrs != sorted(vaddrs):
+        fail("动态补丁未按写入虚拟地址排序")
+    if len(body_d.get("conclusion", "")) != 64:
+        fail("冻结结论 SHA-256 缺失")
+    print(f"verify: PIE RELATIVE + GLOB_DAT 成功，结论 {body_d['conclusion']}")
+
+    status, fetched = http_get("/api/result/verify-pie-dynamic")
+    if status != 200 or not fetched.get("ok") or fetched.get("conclusion") != body_d["conclusion"]:
+        fail("PIE 冻结结论无法按标识读回或内容不一致")
+    print("verify: PIE 冻结结论读回一致")
+
+    # 场景 e：跨映射目标（RW PT_LOAD）拒绝，并清除旧 PIE 成功结论
+    pie_bad = build_pie(
+        dynsyms=[("ext_foo", 0, 0)],
+        dyn_relocs=[{"offset": PIE_DATA_VADDR, "sym": 1, "type": 6, "addend": 0}],
+    )
+    payload_e = {
+        "audit_id": "verify-pie-dynamic",  # 故意复用：旧 PASS 必须被清除
+        "file_base64": b64(pie_bad),
+        "load_base": PIE_BASE,
+        "symbols": {"ext_foo": PIE_EXT_FOO},
+    }
+    status, body_e = http_post("/api/audit", payload_e)
+    if status != 200 or body_e.get("ok"):
+        fail(f"跨映射写入应被拒绝：HTTP {status} {body_e}")
+    if body_e["violation"]["code"] != "target_not_executable":
+        fail(f"违约代码应为 target_not_executable：{body_e['violation']}")
+    if body_e["violation"].get("entry_index") != 0:
+        fail("未定位到首个违约项（entry_index 应为 0）")
+    if "conclusion" in body_e:
+        fail("拒绝响应中不得携带旧冻结结论")
+    status, again = http_get("/api/result/verify-pie-dynamic")
+    if status != 200 or again.get("ok") or "conclusion" in again:
+        fail("旧 PIE 成功结论未被清除")
+    print("verify: PIE 跨映射目标已拒绝（target_not_executable），旧成功结论已清除")
 
 
 def main() -> None:

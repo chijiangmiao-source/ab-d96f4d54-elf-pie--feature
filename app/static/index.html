@@ -52,6 +52,10 @@
   .muted { color: var(--mut); }
   .tag { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11px; border: 1px solid var(--line); }
   .tag.r1 { color: #d2a8ff; } .tag.r2 { color: #ffa657; }
+  .tag.r6 { color: #79c0ff; } .tag.r8 { color: #56d364; }
+  .mapbox { background: var(--panel2); border: 1px solid var(--line); border-radius: 6px;
+            padding: 8px 10px; font-family: var(--mono); font-size: 12px; margin: 6px 0; }
+  .map-x { border-color: var(--ok); color: #56d364; }
   .viol-table td:first-child { color: var(--mut); white-space: nowrap; }
   pre.hex { background: var(--panel2); border: 1px solid var(--line); border-radius: 6px; padding: 10px;
             font-family: var(--mono); font-size: 11.5px; overflow:auto; max-height: 260px; white-space: pre; margin: 8px 0 0; }
@@ -62,7 +66,7 @@
 <body>
 <header>
   <h1>ELF64 重定位载荷审计台</h1>
-  <p>仅接受 ELF64 小端 ET_REL（EM_X86_64）：唯一 <code>.text</code>、指向它的 RELA、R_X86_64_64 / R_X86_64_PC32。失败时定位首个违约项并清除旧成功结论，绝不返回部分补丁。</p>
+  <p>接受 ELF64 小端 EM_X86_64：<strong>ET_REL</strong>（唯一 <code>.text</code>、指向它的 RELA、R_X86_64_64 / R_X86_64_PC32）与 <strong>ET_DYN（PIE 映像）</strong>（PT_DYNAMIC 的 RELA、R_X86_64_RELATIVE / R_X86_64_GLOB_DAT，仅允许写入唯一可执行 PT_LOAD）。失败时定位首个违约项并清除旧成功结论，绝不返回部分补丁。</p>
 </header>
 <main>
   <section class="card">
@@ -70,7 +74,7 @@
     <label for="auditId">稳定审计标识（audit_id）</label>
     <input type="text" id="auditId" placeholder="如 payload-2026-09-29-001" autocomplete="off">
 
-    <label for="fileInput">供应商交付的可重定位目标文件（.o）</label>
+    <label for="fileInput">供应商交付的 ELF64 文件（ET_REL 目标 .o 或已链接 ET_DYN / PIE 映像）</label>
     <input type="file" id="fileInput">
     <div class="filemeta" id="fileMeta">未选择文件</div>
 
@@ -139,7 +143,7 @@ function collectSymbols() {
 function buildPayload() {
   const auditId = $("auditId").value.trim();
   if (!auditId) throw new Error("请填写稳定审计标识");
-  if (!fileBase64) throw new Error("请选择 .o 文件");
+  if (!fileBase64) throw new Error("请选择 ELF 文件（ET_REL 或 ET_DYN）");
   const base = $("loadBase").value.trim();
   if (!base) throw new Error("请填写代码装载基址");
   return { audit_id: auditId, file_base64: fileBase64, load_base: base, symbols: collectSymbols() };
@@ -168,7 +172,7 @@ function renderFail(v) {
   push("首个违约项序号 entry_index", v.entry_index);
   push("所在 RELA 节", v.rela_section);
   push("节内 RELA 下标 rela_index", v.rela_index);
-  push(".text 写入偏移", v.offset);
+  push("写入偏移 / 目标虚拟地址", v.offset);
   push("重定位类型", v.type_name);
   push("符号", v.symbol);
   if (v.detail) push("明细 detail", JSON.stringify(v.detail));
@@ -177,12 +181,14 @@ function renderFail(v) {
     <table class="viol-table">${rows.join("")}</table>`;
 }
 
-function renderPass(r) {
+function tagClass(t) { return {1: "r1", 2: "r2", 6: "r6", 8: "r8"}[t] || ""; }
+
+function renderPassRel(r) {
   const items = r.items.map((it, n) => `
     <tr>
       <td>${n + 1}</td>
       <td>${esc(it.offset_hex)}</td>
-      <td><span class="tag ${it.type === 1 ? "r1" : "r2"}">${esc(it.type_name)}</span></td>
+      <td><span class="tag ${tagClass(it.type)}">${esc(it.type_name)}</span></td>
       <td><span class="sym">${esc(it.symbol)}</span><div class="muted">sym#${it.symbol_index} @ ${esc(it.rela_section)}[${it.rela_index}]</div></td>
       <td>${esc(it.S)}</td>
       <td>${esc(it.A)}<div class="muted">${esc(it.A_hex)}</div></td>
@@ -193,7 +199,7 @@ function renderPass(r) {
     </tr>`).join("");
   const patches = r.patches.map((p) =>
     `${p.offset_hex}  +${p.width}  ${p.type_name}  ${p.symbol}  ${p.before_hex} -> ${p.after_hex}`).join("\n");
-  return `<div class="banner pass"><div class="verdict">✓ 审计通过（PASS）— 结论已冻结</div></div>
+  return `<div class="banner pass"><div class="verdict">✓ 审计通过（PASS · ET_REL）— 结论已冻结</div></div>
   <div class="kv">
     <span class="k">审计标识</span><span>${esc(r.audit_id)}</span>
     <span class="k">冻结结论 SHA-256</span><span>${esc(r.conclusion)}</span>
@@ -212,6 +218,63 @@ function renderPass(r) {
   </details>
   <details><summary>按偏移排序的字节补丁清单</summary><pre class="hex">${esc(patches) || "（无）"}</pre></details>
   <details><summary>重定位后 .text 十六进制转储</summary><pre class="hex">${esc(hexDump(r.patched_text_hex))}</pre></details>`;
+}
+
+function renderPassDyn(r) {
+  const img = r.exec_image;
+  const maps = (r.mappings || []).map((m) => `
+    <div class="mapbox ${m.executable ? "map-x" : ""}">
+      PT_LOAD #${m.index}　${esc(m.flags_str)}
+      虚拟 ${esc(m.vaddr)} .. ${esc(m.vaddr_end)}
+      文件偏移 ${esc(m.file_offset)}
+      filesz ${m.filesz} / memsz ${m.memsz}
+      ${m.executable ? "　<strong>★ 唯一可执行映射（唯一允许的补丁目标）</strong>" : ""}
+    </div>`).join("");
+  const items = r.items.map((it, n) => `
+    <tr>
+      <td>${n + 1}</td>
+      <td>${esc(it.vaddr)}<div class="muted">运行地址 P=${esc(it.P)}</div></td>
+      <td>${esc(it.file_offset_hex)}<div class="muted">映射内 +0x${(it.file_offset - (r.exec_image ? parseInt(r.exec_image.file_offset, 16) : 0)).toString(16)}</div></td>
+      <td>PT_LOAD #${it.mapping}</td>
+      <td><span class="tag ${tagClass(it.type)}">${esc(it.type_name)}</span></td>
+      <td><span class="sym">${it.type === 8 ? "（相对重定位）" : esc(it.symbol)}</span><div class="muted">sym#${it.symbol_index} @ ${esc(it.rela_section)}[${it.rela_index}]</div></td>
+      <td>${esc(it.S)}</td>
+      <td>${esc(it.A)}<div class="muted">${esc(it.A_hex)}</div></td>
+      <td>${esc(it.value)}</td>
+      <td class="bytes-before">${esc(it.before_hex)}</td>
+      <td class="bytes-after">${esc(it.after_hex)}</td>
+    </tr>`).join("");
+  const patches = r.patches.map((p) =>
+    `vaddr ${p.vaddr_hex}  fileoff ${p.file_offset_hex}  PT_LOAD#${p.mapping}  +${p.width}  ${p.type_name}  ${p.symbol || "-"}  ${p.before_hex} -> ${p.after_hex}`).join("\n");
+  return `<div class="banner pass"><div class="verdict">✓ 审计通过（PASS · ET_DYN / PIE）— 结论已冻结</div></div>
+  <div class="kv">
+    <span class="k">审计标识</span><span>${esc(r.audit_id)}</span>
+    <span class="k">冻结结论 SHA-256</span><span>${esc(r.conclusion)}</span>
+    <span class="k">原始文件 SHA-256</span><span>${esc(r.file_sha256)}</span>
+    <span class="k">装载偏移（load base）</span><span>${esc(r.load_base)}</span>
+    <span class="k">动态重定位项数</span><span>${r.item_count}</span>
+    <span class="k">补丁前可执行映像摘要</span><span>${esc(r.image_sha256_before)}</span>
+    <span class="k">重定位后代码摘要 SHA-256</span><span>${esc(r.patched_sha256)}</span>
+  </div>
+  <div class="mapbox map-x">
+    唯一可执行 PT_LOAD #${img.index}　${esc(img.flags_str)}
+    虚拟 ${esc(img.vaddr)} .. ${esc(img.vaddr_end)}
+    文件偏移 ${esc(img.file_offset)}　大小 ${img.file_size} 字节
+    e_entry=${esc(img.entry_vaddr)}
+  </div>
+  <details open><summary>全部 PT_LOAD 映射（核对补丁只落入可执行映射）</summary>${maps}</details>
+  <details open><summary>逐项复算：写入虚拟地址（稳定展示）/ 文件偏移 / 所属映射 / S / A / 计算值 / 写入前后字节，按虚拟地址排序</summary>
+    <table>
+      <thead><tr><th>#</th><th>写入虚拟地址</th><th>文件偏移</th><th>所属映射</th><th>类型</th><th>符号</th><th>S</th><th>A</th><th>计算值 B/A+S</th><th>写入前</th><th>写入后</th></tr></thead>
+      <tbody>${items || '<tr><td colspan="11" class="muted">无动态重定位项</td></tr>'}</tbody>
+    </table>
+  </details>
+  <details><summary>按写入虚拟地址排序的字节补丁清单（含文件偏移与映射）</summary><pre class="hex">${esc(patches) || "（无）"}</pre></details>
+  <details><summary>补丁后可执行 PT_LOAD 映像十六进制转储</summary><pre class="hex">${esc(hexDump(r.patched_image_hex))}</pre></details>`;
+}
+
+function renderPass(r) {
+  return r.elf_type === "ET_DYN" ? renderPassDyn(r) : renderPassRel(r);
 }
 
 function render(r) {

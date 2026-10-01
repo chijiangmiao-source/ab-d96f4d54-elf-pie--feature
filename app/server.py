@@ -128,12 +128,15 @@ def run_audit(payload: Any) -> dict[str, Any]:
 def _public_record(audit_id: str, record: dict[str, Any]) -> dict[str, Any]:
     if record["kind"] == "fail":
         return {"ok": False, "audit_id": audit_id, "violation": record["violation"]}
+    image_key = (
+        "patched_image_hex" if record["result"].get("elf_type") == "ET_DYN" else "patched_text_hex"
+    )
     return {
         "ok": True,
         "audit_id": audit_id,
         "conclusion": record["conclusion"],
         **record["result"],
-        "patched_text_hex": record["patched_text_hex"],
+        image_key: record["patched_text_hex"],
     }
 
 
